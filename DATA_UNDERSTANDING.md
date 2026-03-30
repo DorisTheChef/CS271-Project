@@ -11,11 +11,9 @@ The dataset contains single-cell RNA sequencing (scRNA-seq) data from **Jurkat c
 
 ## 2. Experimental Design (Perturbations)
 The dataset includes **69 distinct treatment groups** tracked in the `obs/target_gene` column:
-- **68 Gene Targets:** Includes key regulators such as:
-    - **Chromatin Remodelers:** `SMARCB1`, `SMARCE1`, `HDAC3`, `KDM1A`.
-    - **Transcriptional Machinery:** `MED1`, `MED12`, `MED24`, `TAF13`, `MAX`.
-    - **Metabolic/Structural:** `ARPC2`, `ATP6V0B`, `HMGCR`, `MAT2A`.
-- **1 Control Group:** Labeled `non-targeting`. This serves as the baseline for all differential expression analyses.
+- **68 Gene Targets:** Targeted for CRISPR-mediated knockdown.
+- **1 Control Group:** Labeled `non-targeting` (12,013 cells).
+- **Cell Count Distribution:** The distribution of cells per perturbation is highly imbalanced. While the control group is the largest, gene targets like `TFAM` (2,555 cells) have significantly more coverage than others like `EIF4B` (461 cells) or `SMARCB1` (204 cells).
 
 ## 3. Data Structure (HDF5/AnnData Mapping)
 | HDF5 Group | Mapping | Description |
@@ -26,7 +24,13 @@ The dataset includes **69 distinct treatment groups** tracked in the `obs/target
 | `layers` | `adata.layers` | Alternative versions of the expression matrix. |
 | `obsm` | `adata.obsm` | Multi-dimensional embeddings (e.g., PCA, UMAP). |
 
-## 4. Key Metadata Fields
+## 4. Derived Data Products
+| File | Description |
+| :--- | :--- |
+| `perturbation_cell_counts.csv` | A summary table containing the number of cells per perturbation (`target_gene`). |
+| `zyt/processed_adata.h5ad` | Preprocessed AnnData object containing all genes, HVG markers, and UMAP embeddings. |
+
+## 5. Key Metadata Fields
 - **`UMI_count`**: Number of unique transcripts detected per cell; used to assess library complexity.
 - **`mitopercent`**: Percentage of reads mapping to mitochondrial genes; used as a proxy for cell stress or damage.
 - **`target_gene`**: The specific gene targeted by CRISPR in that cell.

@@ -17,6 +17,10 @@ This project is for CS271 and involves analyzing single-cell data, specifically 
     - **Metrics:** `means` (average expression) and `dispersions` (variation relative to mean) are calculated in bins. `dispersions_norm` is the ranking criteria.
     - **Target Genes:** Always force target genes into the HVG list to ensure perturbation effects are captured in PCA/UMAP.
 
+## Data Exports & Products
+- **`perturbation_cell_counts.csv`**: Contains cell counts for each perturbation. Generated via `@zyt/data_analysis.ipynb`.
+- **`zyt/processed_adata.h5ad`**: The standard preprocessed dataset for downstream analysis.
+
 ## Environment
 - Use the `.venv` virtual environment located in the root directory.
 - Dependencies include `h5py`, `numpy`, and standard data science libraries.
