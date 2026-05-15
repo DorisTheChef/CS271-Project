@@ -1,0 +1,546 @@
+"""
+Deep MLP baseline for knockdown expression prediction.
+
+This keeps the original notebook's data setup and training hyperparameters:
+- 5-fold StratifiedKFold
+- MSELoss
+- Adam, lr=1e-3
+- batch_size=64
+- num_epochs=20
+
+Model architecture:
+input_dim -> 512 -> 512 -> 512 -> 512 -> 512 -> output_dim
+
+That means:
+- 5 hidden Linear layers
+- 1 output Linear layer
+- ReLU activation after each hidden layer
+- No activation after the final output layer because this is regression
+"""
+
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader, Subset
+from sklearn.model_selection import StratifiedKFold
+from scipy.stats import pearsonr
+
+
+# -------------------------
+# Hyperparameters
+# -------------------------
+SEED = 42
+N_SPLITS = 5
+NUM_EPOCHS = 20
+BATCH_SIZE = 64
+LEARNING_RATE = 1e-3
+
+HIDDEN_DIM = 512
+NUM_HIDDEN_LAYERS = 5
+
+CONTROL_LABEL = "non-targeting"
+
+
+# -------------------------
+# Reproducibility
+# -------------------------
+def set_seed(seed: int = 42) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# -------------------------
+# Dataset
+# -------------------------
+class KnockdownDataset(Dataset):
+    def __init__(self, x: np.ndarray, y: np.ndarray):
+        self.x = torch.from_numpy(x.astype(np.float32))
+        self.y = torch.from_numpy(y.astype(np.float32))
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx]
+
+
+# -------------------------
+# MLP model
+# -------------------------
+class KnockdownMLP(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int = 512,
+        num_hidden_layers: int = 5,
+    ):
+        super().__init__()
+
+        if num_hidden_layers < 1:
+            raise ValueError("num_hidden_layers must be at least 1")
+
+        layers = []
+
+        # First hidden layer
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.ReLU())
+
+        # Additional hidden layers
+        for _ in range(num_hidden_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+
+        # Output layer
+        # No activation here because this is a regression task.
+        layers.append(nn.Linear(hidden_dim, output_dim))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# -------------------------
+# Metrics
+# -------------------------
+def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray):
+    """
+    Returns:
+    - MSE over all expression values
+    - average per-cell Pearson correlation
+    """
+    mse = np.mean((y_true - y_pred) ** 2)
+
+    corrs = []
+
+    for i in range(len(y_true)):
+        true_i = y_true[i]
+        pred_i = y_pred[i]
+
+        if np.std(true_i) > 0 and np.std(pred_i) > 0:
+            corr, _ = pearsonr(true_i, pred_i)
+
+            if np.isnan(corr):
+                corr = 0.0
+
+            corrs.append(corr)
+        else:
+            corrs.append(0.0)
+
+    mean_corr = np.mean(corrs)
+
+    return mse, mean_corr
+
+
+# -------------------------
+# Data loading
+# -------------------------
+def find_data_path() -> Path:
+    """
+    Looks for processed_adata.h5ad in the same places as your original notebook.
+    """
+    candidates = [
+        Path("processed_adata.h5ad"),
+        Path("baseline") / "processed_adata.h5ad",
+        Path("zyt") / "processed_adata.h5ad",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            return path
+
+    raise FileNotFoundError(
+        "Could not find processed_adata.h5ad in current folder, baseline/, or zyt/"
+    )
+
+
+def prepare_data():
+    data_path = find_data_path()
+    print("Loading data from:", data_path)
+
+    adata = sc.read_h5ad(data_path)
+    print("adata shape:", adata.shape)
+
+    if "target_gene" not in adata.obs:
+        raise KeyError("adata.obs must contain a 'target_gene' column")
+
+    # Convert expression matrix to dense float32 array for PyTorch
+    X = adata.X
+
+    if hasattr(X, "toarray"):
+        X = X.toarray()
+
+    X = X.astype(np.float32)
+
+    # Make target_gene categorical
+    target_gene_series = adata.obs["target_gene"].astype("category")
+
+    if CONTROL_LABEL not in list(target_gene_series.cat.categories):
+        raise ValueError(f"Could not find control label: {CONTROL_LABEL}")
+
+    # -------------------------
+    # Mean non-targeting control profile
+    # -------------------------
+    control_mask = target_gene_series == CONTROL_LABEL
+    control_expr = X[control_mask.values]
+
+    if control_expr.shape[0] == 0:
+        raise ValueError("No non-targeting control cells found")
+
+    control_template = control_expr.mean(axis=0).astype(np.float32)
+
+    # -------------------------
+    # Perturbation target genes
+    # -------------------------
+    target_genes_all = [
+        gene for gene in target_gene_series.cat.categories
+        if gene != CONTROL_LABEL
+    ]
+
+    gene_to_idx = {
+        gene: idx for idx, gene in enumerate(target_genes_all)
+    }
+
+    # Optional sanity check
+    missing_genes = [
+        gene for gene in target_genes_all
+        if gene not in adata.var_names
+    ]
+
+    if missing_genes:
+        print(
+            f"Warning: {len(missing_genes)} target genes are missing from output genes:"
+        )
+        print(missing_genes)
+    else:
+        print("All target genes are present in the output features.")
+
+    # -------------------------
+    # Build perturbation-only dataset
+    # -------------------------
+    perturb_mask = target_gene_series != CONTROL_LABEL
+    perturb_indices = np.where(perturb_mask.values)[0]
+
+    one_hot = np.zeros(
+        (len(perturb_indices), len(target_genes_all)),
+        dtype=np.float32,
+    )
+
+    labels = np.zeros(
+        len(perturb_indices),
+        dtype=np.int64,
+    )
+
+    for row_idx, adata_idx in enumerate(perturb_indices):
+        gene = target_gene_series.iat[adata_idx]
+        gene_idx = gene_to_idx[gene]
+
+        one_hot[row_idx, gene_idx] = 1.0
+        labels[row_idx] = gene_idx
+
+    # Input:
+    # mean non-targeting control expression profile + target-gene one-hot label
+    control_block = np.repeat(
+        control_template[None, :],
+        len(perturb_indices),
+        axis=0,
+    )
+
+    inputs = np.concatenate(
+        [control_block, one_hot],
+        axis=1,
+    ).astype(np.float32)
+
+    # Target:
+    # observed perturbed expression profile
+    targets = X[perturb_indices].astype(np.float32)
+
+    print("inputs shape:", inputs.shape)
+    print("targets shape:", targets.shape)
+    print("number of target genes:", len(target_genes_all))
+
+    return data_path, inputs, targets, labels, control_template, target_genes_all
+
+
+# -------------------------
+# Training and evaluation
+# -------------------------
+def main():
+    set_seed(SEED)
+
+    data_path, inputs, targets, labels, control_template, target_genes_all = prepare_data()
+
+    dataset = KnockdownDataset(inputs, targets)
+
+    input_dim = inputs.shape[1]
+    output_dim = targets.shape[1]
+
+    print("\nModel setup:")
+    print("input_dim:", input_dim)
+    print("hidden_dim:", HIDDEN_DIM)
+    print("num_hidden_layers:", NUM_HIDDEN_LAYERS)
+    print("output_dim:", output_dim)
+
+    architecture_string = (
+        f"{input_dim} -> "
+        + " -> ".join([str(HIDDEN_DIM)] * NUM_HIDDEN_LAYERS)
+        + f" -> {output_dim}"
+    )
+
+    print("MLP architecture:", architecture_string)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    skf = StratifiedKFold(
+        n_splits=N_SPLITS,
+        shuffle=True,
+        random_state=SEED,
+    )
+
+    fold_metrics = []
+    epoch_history = []
+
+    model = None
+
+    for fold, (train_idx, val_idx) in enumerate(
+        skf.split(inputs, labels),
+        start=1,
+    ):
+        print(f"\n=== Fold {fold}/{N_SPLITS} ===")
+
+        train_dataset = Subset(dataset, train_idx)
+        val_dataset = Subset(dataset, val_idx)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+        )
+
+        model = KnockdownMLP(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hidden_dim=HIDDEN_DIM,
+            num_hidden_layers=NUM_HIDDEN_LAYERS,
+        ).to(device)
+
+        criterion = nn.MSELoss()
+
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=LEARNING_RATE,
+        )
+
+        # -------------------------
+        # Epoch training loop
+        # -------------------------
+        for epoch in range(1, NUM_EPOCHS + 1):
+            # ----- Training -----
+            model.train()
+            train_loss = 0.0
+
+            for x_batch, y_batch in train_loader:
+                x_batch = x_batch.to(device)
+                y_batch = y_batch.to(device)
+
+                optimizer.zero_grad()
+
+                preds = model(x_batch)
+                loss = criterion(preds, y_batch)
+
+                loss.backward()
+                optimizer.step()
+
+                train_loss += loss.item() * x_batch.size(0)
+
+            train_loss /= len(train_loader.dataset)
+
+            # ----- Validation -----
+            model.eval()
+            val_loss = 0.0
+
+            with torch.no_grad():
+                for x_batch, y_batch in val_loader:
+                    x_batch = x_batch.to(device)
+                    y_batch = y_batch.to(device)
+
+                    preds = model(x_batch)
+                    loss = criterion(preds, y_batch)
+
+                    val_loss += loss.item() * x_batch.size(0)
+
+            val_loss /= len(val_loader.dataset)
+
+            # Save epoch losses
+            epoch_history.append(
+                {
+                    "fold": fold,
+                    "epoch": epoch,
+                    "train_loss": float(train_loss),
+                    "val_loss": float(val_loss),
+                }
+            )
+
+            # Print every epoch
+            print(
+                f"  Epoch {epoch}/{NUM_EPOCHS} | "
+                f"Train Loss: {train_loss:.6f} | "
+                f"Val Loss: {val_loss:.6f}"
+            )
+
+        # -------------------------
+        # Full fold evaluation
+        # -------------------------
+        model.eval()
+
+        val_preds = []
+        val_targets = []
+
+        with torch.no_grad():
+            for x_batch, y_batch in val_loader:
+                x_batch = x_batch.to(device)
+
+                preds = model(x_batch).cpu().numpy()
+
+                val_preds.append(preds)
+                val_targets.append(y_batch.numpy())
+
+        val_preds = np.concatenate(val_preds, axis=0)
+        val_targets = np.concatenate(val_targets, axis=0)
+
+        mse, corr = calculate_metrics(
+            y_true=val_targets,
+            y_pred=val_preds,
+        )
+
+        # Baseline:
+        # predict the mean non-targeting control profile for every validation sample
+        mean_ctrl_preds = np.tile(
+            control_template,
+            (len(val_targets), 1),
+        )
+
+        base_mse, base_corr = calculate_metrics(
+            y_true=val_targets,
+            y_pred=mean_ctrl_preds,
+        )
+
+        fold_metrics.append(
+            {
+                "fold": fold,
+                "mse": float(mse),
+                "corr": float(corr),
+                "base_mse": float(base_mse),
+                "base_corr": float(base_corr),
+            }
+        )
+
+        print(
+            f"Fold {fold} | "
+            f"MLP: MSE={mse:.4f}, Corr={corr:.4f} | "
+            f"Mean Control: MSE={base_mse:.4f}, Corr={base_corr:.4f}"
+        )
+
+    # -------------------------
+    # Final cross-validation results
+    # -------------------------
+    avg_mse = np.mean([f["mse"] for f in fold_metrics])
+    avg_corr = np.mean([f["corr"] for f in fold_metrics])
+
+    avg_base_mse = np.mean([f["base_mse"] for f in fold_metrics])
+    avg_base_corr = np.mean([f["base_corr"] for f in fold_metrics])
+
+    print(f"\nFinal Results: Average over {N_SPLITS} folds")
+    print(f"MLP Model      - MSE: {avg_mse:.4f}, Pearson Corr: {avg_corr:.4f}")
+    print(f"Mean Control   - MSE: {avg_base_mse:.4f}, Pearson Corr: {avg_base_corr:.4f}")
+    print(
+        f"Improvement    - MSE: {avg_base_mse - avg_mse:.4f}, "
+        f"Corr: {avg_corr - avg_base_corr:.4f}"
+    )
+
+    # -------------------------
+    # Save epoch losses
+    # -------------------------
+    loss_log_path = data_path.parent / "knockdown_mlp_epoch_losses.csv"
+
+    pd.DataFrame(epoch_history).to_csv(
+        loss_log_path,
+        index=False,
+    )
+
+    print(f"\nEpoch losses saved to {loss_log_path}")
+
+    # -------------------------
+    # Save fold metrics
+    # -------------------------
+    fold_metrics_path = data_path.parent / "knockdown_mlp_fold_metrics.csv"
+
+    pd.DataFrame(fold_metrics).to_csv(
+        fold_metrics_path,
+        index=False,
+    )
+
+    print(f"Fold metrics saved to {fold_metrics_path}")
+
+    # -------------------------
+    # Save final fold's model weights
+    # -------------------------
+    model_save_path = data_path.parent / "knockdown_mlp_model.pth"
+
+    torch.save(
+        model.state_dict(),
+        model_save_path,
+    )
+
+    print(f"MLP model weights saved to {model_save_path}")
+
+    # -------------------------
+    # Save model config
+    # -------------------------
+    config = {
+        "model_type": "KnockdownMLP",
+        "input_dim": int(input_dim),
+        "hidden_dim": int(HIDDEN_DIM),
+        "num_hidden_layers": int(NUM_HIDDEN_LAYERS),
+        "output_dim": int(output_dim),
+        "architecture": architecture_string,
+        "activation": "ReLU",
+        "final_activation": None,
+        "n_splits": int(N_SPLITS),
+        "num_epochs": int(NUM_EPOCHS),
+        "batch_size": int(BATCH_SIZE),
+        "learning_rate": float(LEARNING_RATE),
+        "seed": int(SEED),
+        "control_label": CONTROL_LABEL,
+        "target_genes": list(map(str, target_genes_all)),
+    }
+
+    config_save_path = data_path.parent / "knockdown_mlp_config.json"
+
+    with open(config_save_path, "w", encoding="utf-8") as f:
+        json.dump(
+            config,
+            f,
+            indent=2,
+        )
+
+    print(f"MLP model config saved to {config_save_path}")
+
+
+if __name__ == "__main__":
+    main()
