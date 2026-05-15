@@ -17,7 +17,7 @@ The raw `jurkat.h5` file is **not tracked in git** (see [Data setup](#data-setup
 ### Important preprocessing rules
 
 - The `X` matrix is **already log-normalized** — do **not** run `sc.pp.normalize_total` or `sc.pp.log1p`.
-- Use **3,000 highly variable genes** (`n_top_genes=3000`, `flavor='seurat'`), and **force all 68 target genes** into the HVG set.
+- Use **3,051 highly variable genes** (`n_top_genes=3051`, `flavor='seurat'`), and **force all 68 target genes** into the HVG set.
 - `processed_adata.h5ad` keeps the full **21,412 × 18,080** matrix; HVGs are marked in `adata.var['highly_variable']`.
 
 ## Repository structure
